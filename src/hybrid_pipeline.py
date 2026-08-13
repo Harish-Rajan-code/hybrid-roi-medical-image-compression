@@ -1,4 +1,3 @@
-
 import argparse
 import math
 import os
@@ -170,7 +169,7 @@ def load_unet(model_path):
 # ============================================================
 
 class ConvEncoder(nn.Module):
-   
+
 
     def __init__(
         self,
@@ -181,7 +180,7 @@ class ConvEncoder(nn.Module):
         super().__init__()
 
         layers = []
-        ch = in_ch
+        channels = in_ch
 
         for i in range(num_down):
             out_ch = base_ch * (2 ** i)
@@ -189,7 +188,7 @@ class ConvEncoder(nn.Module):
             layers.extend(
                 [
                     nn.Conv2d(
-                        ch,
+                        channels,
                         out_ch,
                         kernel_size=4,
                         stride=2,
@@ -200,17 +199,16 @@ class ConvEncoder(nn.Module):
                 ]
             )
 
-            ch = out_ch
+            channels = out_ch
 
         self.net = nn.Sequential(*layers)
-        self.out_ch = ch
+        self.out_ch = channels
 
     def forward(self, x):
         return self.net(x)
 
 
 class TransformerBottleneck(nn.Module):
-    
 
     def __init__(
         self,
@@ -235,7 +233,8 @@ class TransformerBottleneck(nn.Module):
             batch_first=True,
         )
 
-        self.transformer = nn.TransformerEncoder(
+       
+        self.trans = nn.TransformerEncoder(
             encoder_layer,
             num_layers=num_layers,
         )
@@ -257,11 +256,12 @@ class TransformerBottleneck(nn.Module):
             .permute(0, 2, 1)
         )
 
-        tokens = self.transformer(tokens)
+        tokens = self.trans(tokens)
 
         tokens = (
             tokens
             .permute(0, 2, 1)
+            .contiguous()
             .view(
                 batch_size,
                 -1,
@@ -289,15 +289,17 @@ class ConvDecoder(nn.Module):
             in_ch = base_ch * (2 ** (num_up - 1))
 
         layers = []
-        ch = in_ch
+        channels = in_ch
 
         for i in range(num_up):
-            out_ch_conv = base_ch * (2 ** (num_up - i - 1))
+            out_ch_conv = (
+                base_ch * (2 ** (num_up - i - 1))
+            )
 
             layers.extend(
                 [
                     nn.ConvTranspose2d(
-                        ch,
+                        channels,
                         out_ch_conv,
                         kernel_size=4,
                         stride=2,
@@ -308,12 +310,12 @@ class ConvDecoder(nn.Module):
                 ]
             )
 
-            ch = out_ch_conv
+            channels = out_ch_conv
 
         layers.extend(
             [
                 nn.Conv2d(
-                    ch,
+                    channels,
                     out_ch,
                     kernel_size=3,
                     stride=1,
@@ -331,41 +333,114 @@ class ConvDecoder(nn.Module):
 
 class TransformerCompressor(nn.Module):
 
-
-    def __init__(self):
+    def __init__(
+        self,
+        base_ch=BASE_CHANNELS,
+        token_dim=TOKEN_DIM,
+    ):
         super().__init__()
 
-        self.encoder = ConvEncoder(
+        self.enc = ConvEncoder(
             in_ch=1,
-            base_ch=BASE_CHANNELS,
+            base_ch=base_ch,
             num_down=4,
         )
 
-        self.bottleneck = TransformerBottleneck(
-            self.encoder.out_ch,
-            token_dim=TOKEN_DIM,
+        self.bot = TransformerBottleneck(
+            in_ch=self.enc.out_ch,
+            token_dim=token_dim,
             num_layers=NUM_TRANSFORMER_LAYERS,
             num_heads=NUM_HEADS,
         )
 
-        self.decoder = ConvDecoder(
+        self.dec = ConvDecoder(
             out_ch=1,
-            base_ch=BASE_CHANNELS,
+            base_ch=base_ch,
             num_up=4,
-            in_ch=self.encoder.out_ch,
+            in_ch=self.enc.out_ch,
         )
 
-    def forward(self, x):
-        latent = self.encoder(x)
+    def forward(self, x, training_quant=False):
+        batch_size, _, height, width = x.shape
 
-        latent = self.bottleneck(latent)
+      
+        latent = self.enc(x)
 
-        
-        quantized = torch.round(latent * 255.0) / 255.0
+        latent = self.bot(latent)
 
-        reconstruction = self.decoder(quantized)
 
-        return reconstruction, latent
+        if training_quant:
+            quantized_latent = (
+                latent
+                + torch.empty_like(latent).uniform_(
+                    -0.5,
+                    0.5,
+                )
+            )
+        else:
+            quantized = (
+                torch.round(latent * 255.0)
+                / 255.0
+            )
+
+          
+            quantized_latent = (
+                quantized - latent
+            ).detach() + latent
+
+     
+        scale = (
+            torch.std(
+                latent,
+                dim=[1, 2, 3],
+                keepdim=True,
+            )
+            + 1e-8
+        )
+
+        gaussian_constant = math.sqrt(
+            2.0 * math.pi
+        )
+
+        probability = (
+            1.0
+            / (gaussian_constant * scale)
+        ) * torch.exp(
+            -0.5 * (latent / scale) ** 2
+        )
+
+        probability = torch.clamp(
+            probability,
+            min=1e-9,
+        )
+
+        bits_per_element = -torch.log2(
+            probability
+        )
+
+        bits_per_image = (
+            bits_per_element
+            .reshape(batch_size, -1)
+            .sum(dim=1)
+        )
+
+        bits_per_pixel = (
+            bits_per_image
+            / (height * width)
+        )
+
+        reconstruction = self.dec(
+            quantized_latent
+        )
+
+        return (
+            reconstruction,
+            quantized_latent,
+            bits_per_pixel.mean(),
+            {
+                "scale": scale.mean(),
+            },
+        )
 
 
 # ============================================================
@@ -387,7 +462,6 @@ def clean_state_dict(state_dict):
 
 
 def load_transformer(model_path):
-   
 
     if not os.path.isfile(model_path):
         raise FileNotFoundError(
@@ -396,13 +470,15 @@ def load_transformer(model_path):
 
     print("\nLoading Transformer compressor...")
 
-    model = TransformerCompressor().to(DEVICE)
+    model = TransformerCompressor(
+        base_ch=BASE_CHANNELS,
+        token_dim=TOKEN_DIM,
+    ).to(DEVICE)
 
     checkpoint = torch.load(
         model_path,
         map_location=DEVICE,
     )
-
 
     if isinstance(checkpoint, dict):
         if "state_dict" in checkpoint:
@@ -410,30 +486,32 @@ def load_transformer(model_path):
         elif "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
         else:
+
             state_dict = checkpoint
     else:
-        state_dict = checkpoint
+        raise TypeError(
+            "Unsupported Transformer checkpoint format. "
+            "Expected a PyTorch state_dict dictionary."
+        )
 
     state_dict = clean_state_dict(state_dict)
 
-    missing, unexpected = model.load_state_dict(
-        state_dict,
-        strict=False,
-    )
-
-    if missing:
-        print(
-            f"Warning: {len(missing)} missing model parameters."
+    try:
+        model.load_state_dict(
+            state_dict,
+            strict=True,
         )
-
-    if unexpected:
-        print(
-            f"Warning: {len(unexpected)} unexpected parameters."
-        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Transformer checkpoint does not match the "
+            "inference architecture. No partial loading was allowed.\n\n"
+            f"Original error:\n{exc}"
+        ) from exc
 
     model.eval()
 
     print("Transformer compressor loaded successfully.")
+    print("Checkpoint loaded with strict=True.")
 
     return model
 
@@ -722,8 +800,14 @@ def reconstruct_roi(
     )
 
     with torch.no_grad():
-        reconstructed, latent = transformer(
-            roi_tensor
+        (
+            reconstructed,
+            quantized_latent,
+            bits_per_pixel,
+            metadata,
+        ) = transformer(
+            roi_tensor,
+            training_quant=False,
         )
 
     reconstructed = (
@@ -744,40 +828,12 @@ def reconstruct_roi(
         interpolation=cv2.INTER_LINEAR,
     )
 
-    return reconstructed, latent
-
-
-# ============================================================
-# ESTIMATED TRANSFORMER BIT RATE
-# ============================================================
-
-def estimate_latent_bpp(latent):
-
-    std = torch.std(latent)
-
-    std = torch.clamp(
-        std,
-        min=1e-8,
+    return (
+        reconstructed,
+        quantized_latent,
+        bits_per_pixel,
+        metadata,
     )
-
-    probability = (
-        1.0
-        / (
-            math.sqrt(2.0 * math.pi)
-            * std
-        )
-    ) * torch.exp(
-        -0.5 * (latent / std) ** 2
-    )
-
-    probability = torch.clamp(
-        probability,
-        min=1e-9,
-    )
-
-    bits = -torch.log2(probability)
-
-    return float(bits.mean().item())
 
 
 # ============================================================
@@ -863,13 +919,18 @@ def process_single_image(
         "with Transformer compressor..."
     )
 
-    reconstructed_roi, latent = reconstruct_roi(
+    (
+        reconstructed_roi,
+        quantized_latent,
+        roi_bpp_tensor,
+        transformer_metadata,
+    ) = reconstruct_roi(
         transformer,
         roi,
     )
 
-    roi_bpp_estimate = estimate_latent_bpp(
-        latent
+    roi_bpp_estimate = float(
+        roi_bpp_tensor.detach().item()
     )
 
     roi_metrics = compute_metrics(
@@ -946,8 +1007,6 @@ def process_single_image(
         "\n[5/5] Creating hybrid reconstruction..."
     )
 
-    # Place the reconstructed ROI back into
-    # its original spatial position.
     roi_canvas = np.zeros_like(
         image,
         dtype=np.uint8,
@@ -958,12 +1017,11 @@ def process_single_image(
         x1:x2,
     ] = reconstructed_roi
 
-    # Soft alpha mask based on the actual segmentation.
     soft_mask = create_soft_mask(
         mask * 255
     )
 
-    # Blend only where the ROI exists.
+  
     hybrid = (
         compressed_background.astype(np.float32)
         * (1.0 - soft_mask)
@@ -990,8 +1048,7 @@ def process_single_image(
     # COMPRESSION SIZE ESTIMATION
     # --------------------------------------------------------
 
-    # Transformer BPP is an entropy-model estimate.
-    # Convert it into an estimated ROI byte count.
+ 
     roi_pixel_count = roi.size
 
     estimated_roi_bytes = (
@@ -1095,6 +1152,9 @@ def process_single_image(
         "overall_metrics": overall_metrics,
         "roi_bpp": roi_bpp_estimate,
         "roi_cr": roi_cr,
+        "transformer_scale": float(
+            transformer_metadata["scale"].detach().item()
+        ),
         "background_size_bytes": background_size_bytes,
         "estimated_roi_bytes": estimated_roi_bytes,
         "estimated_total_bytes": estimated_total_bytes,
@@ -1166,7 +1226,7 @@ def print_metrics(results):
     )
 
     print(
-        f"Estimated BPP : "
+        f"Transformer BPP : "
         f"{results['roi_bpp']:.4f}"
     )
 

@@ -1,19 +1,4 @@
-"""
-ROI Segmentation using Attention U-Net
 
-This module implements the ROI segmentation stage of the
-Hybrid ROI and Non-ROI Medical Image Compression Framework.
-
-The model uses:
-- Residual convolution blocks
-- Attention gates
-- CLAHE preprocessing
-- Focal Tversky loss
-- Dice and IoU evaluation
-
-The trained model can subsequently be used by the hybrid
-compression pipeline to identify diagnostically important regions.
-"""
 
 import os
 import random
@@ -55,7 +40,7 @@ random.seed(SEED)
 # ==========================================================
 
 def configure_gpu():
-    """Enable GPU memory growth when a compatible GPU is available."""
+    
     gpus = tf.config.experimental.list_physical_devices("GPU")
 
     if gpus:
@@ -76,15 +61,7 @@ def configure_gpu():
 # ==========================================================
 
 def refine_mask(mask, closing_iter=3, min_size=500):
-    """
-    Refine a binary ROI mask using morphological operations.
-
-    Operations:
-    - Morphological closing
-    - Hole filling
-    - Removal of small connected components
-    - Morphological opening
-    """
+  
 
     mask = mask.astype(np.uint8)
 
@@ -129,23 +106,7 @@ def refine_mask(mask, closing_iter=3, min_size=500):
 # ==========================================================
 
 def attention_gate(x, g, inter_channels):
-    """
-    Attention gate used in the decoder of the Attention U-Net.
-
-    Parameters
-    ----------
-    x : Tensor
-        Encoder feature map.
-    g : Tensor
-        Decoder/gating feature map.
-    inter_channels : int
-        Number of intermediate channels.
-
-    Returns
-    -------
-    Tensor
-        Attention-weighted encoder feature map.
-    """
+  
 
     theta_x = layers.Conv2D(
         inter_channels,
@@ -186,9 +147,7 @@ def attention_gate(x, g, inter_channels):
 # ==========================================================
 
 def residual_conv_block(x, filters, use_batchnorm=True):
-    """
-    Residual convolutional block used throughout the U-Net.
-    """
+  
 
     shortcut = x
 
@@ -212,9 +171,7 @@ def residual_conv_block(x, filters, use_batchnorm=True):
     if use_batchnorm:
         x = layers.BatchNormalization()(x)
 
-    # Match the number of channels in the residual connection.
-    # Static shape is used here instead of ops.shape() so that
-    # the comparison works correctly during model construction.
+  
     if shortcut.shape[-1] != filters:
         shortcut = layers.Conv2D(
             filters,
@@ -233,9 +190,7 @@ def residual_conv_block(x, filters, use_batchnorm=True):
 # ==========================================================
 
 def attention_unet(input_size=(256, 256, 1)):
-    """
-    Build an Attention U-Net with residual connections.
-    """
+ 
 
     inputs = layers.Input(input_size)
 
@@ -257,13 +212,11 @@ def attention_unet(input_size=(256, 256, 1)):
     p4 = layers.MaxPooling2D((2, 2))(c4)
     p4 = layers.Dropout(0.2)(p4)
 
-    # ---------------- Bottleneck ----------------
 
     c5 = residual_conv_block(p4, 1024)
     c5 = layers.Dropout(0.3)(c5)
 
-    # ---------------- Decoder ----------------
-
+ 
     u6 = layers.Conv2DTranspose(
         512,
         (2, 2),
@@ -375,7 +328,7 @@ def focal_tversky_loss(
     gamma=0.75,
     smooth=1e-6
 ):
-    """Focal Tversky loss used for ROI segmentation."""
+   
 
     y_true_f = tf.reshape(y_true, [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
@@ -409,19 +362,13 @@ def focal_tversky_loss(
 # ==========================================================
 
 def load_pairs(root, img_size=IMG_SIZE, augment=False):
-    """
-    Load image-mask pairs recursively from a directory.
-
-    Image files are matched with mask files using the image
-    filename stem.
-    """
-
+   
     if not os.path.isdir(root):
         raise FileNotFoundError(
             f"Dataset directory not found: {root}"
         )
 
-    # Recursively collect image files.
+   
     all_files = glob(
         os.path.join(root, "**", "*"),
         recursive=True
@@ -538,15 +485,12 @@ def load_pairs(root, img_size=IMG_SIZE, augment=False):
 # ==========================================================
 
 def train_unet(dataset_path, output_path):
-    """
-    Train the Attention U-Net and save the trained model.
-    """
-
+  
     print("=" * 60)
     print("PHASE 1: TRAINING ATTENTION U-NET ON ROI DATASET")
     print("=" * 60)
 
-    # Load dataset
+    
     X, Y = load_pairs(
         dataset_path,
         augment=True
@@ -558,7 +502,7 @@ def train_unet(dataset_path, output_path):
             "Check the dataset directory and filename structure."
         )
 
-    # Train-validation split
+    
     X_train, X_val, Y_train, Y_val = train_test_split(
         X,
         Y,
@@ -571,12 +515,12 @@ def train_unet(dataset_path, output_path):
         f"Validation: {len(X_val)}"
     )
 
-    # Build model
+   
     unet_model = attention_unet(
         (IMG_SIZE, IMG_SIZE, 1)
     )
 
-    # Compile model
+   
     unet_model.compile(
         optimizer=tf.keras.optimizers.Adam(
             learning_rate=LEARNING_RATE_UNET
@@ -589,7 +533,7 @@ def train_unet(dataset_path, output_path):
         ]
     )
 
-    # Learning-rate scheduler
+    
     callbacks = [
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
@@ -615,7 +559,7 @@ def train_unet(dataset_path, output_path):
         verbose=1
     )
 
-    # Evaluate
+   
     val_loss, val_acc, val_dice, val_iou = (
         unet_model.evaluate(
             X_val,
@@ -631,7 +575,7 @@ def train_unet(dataset_path, output_path):
         f"IoU: {val_iou:.4f}"
     )
 
-    # Create output directory
+   
     output_directory = os.path.dirname(output_path)
 
     if output_directory:
@@ -640,7 +584,7 @@ def train_unet(dataset_path, output_path):
             exist_ok=True
         )
 
-    # Save model
+    
     unet_model.save(output_path)
 
     print(
@@ -648,7 +592,7 @@ def train_unet(dataset_path, output_path):
         f"{output_path}"
     )
 
-    # Clean up
+    
     tf.keras.backend.clear_session()
 
     del (
@@ -672,9 +616,7 @@ def train_unet(dataset_path, output_path):
 # ==========================================================
 
 def main():
-    """
-    Command-line entry point for ROI segmentation training.
-    """
+   
 
     parser = argparse.ArgumentParser(
         description=(
